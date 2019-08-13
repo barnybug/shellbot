@@ -2,15 +2,19 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/google/shlex"
 	tgbotapi "gopkg.in/telegram-bot-api.v4"
 )
+
+const ScriptTimeout = time.Minute * 20
 
 var htmlReplacer = strings.NewReplacer("<", "&lt;", ">", "&gt;", "&", "&amp;")
 
@@ -18,27 +22,95 @@ func htmlEscape(s string) string {
 	return htmlReplacer.Replace(s)
 }
 
-func runCommand(api *tgbotapi.BotAPI, chatID int64, text string) {
-	args, err := shlex.Split(text)
-	if err != nil {
-		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("️️️⚠️ Couldn't parse: %s", err))
-		api.Send(msg)
-		return
-	}
+type ReplyWriter struct {
+	api    *tgbotapi.BotAPI
+	chatID int64
+}
 
-	cmd := exec.Command(args[0], args[1:]...)
-	output, err := cmd.CombinedOutput()
+func (r ReplyWriter) Write(b []byte) (int, error) {
+	log.Println("<-", string(b))
+	text := "<code>" + htmlEscape(string(b)) + "</code>"
+	msg := tgbotapi.NewMessage(r.chatID, text)
+	msg.ParseMode = "HTML"
+	r.api.Send(msg)
+	return len(b), nil
+}
+
+// io.Writer that simply resets a Timer on data (which it discards).
+type TimerResetter struct {
+	timer *time.Timer
+}
+
+func (r TimerResetter) Write(b []byte) (int, error) {
+	r.timer.Reset(ScriptTimeout)
+	return len(b), nil
+}
+
+func runCommand(api *tgbotapi.BotAPI, chatID int64, text string) {
+	args := []string{
+		"-c",
+		text,
+	}
+	cmd := exec.Command("/bin/bash", args...)
+	stdout, err := cmd.StdoutPipe()
+	stderr, err := cmd.StderrPipe()
+	if err == nil {
+		err = cmd.Start()
+	}
 	if err != nil {
 		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("⚠️ %s", err))
 		api.Send(msg)
+		return
 	}
-	if output != nil {
-		log.Println("<-", string(output))
-		text := "<code>" + htmlEscape(string(output)) + "</code>"
-		msg := tgbotapi.NewMessage(chatID, text)
-		msg.ParseMode = "HTML"
-		api.Send(msg)
-	}
+	timer := time.NewTimer(ScriptTimeout)
+	timerResetter := TimerResetter{timer}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	replyWriter := ReplyWriter{api, chatID}
+	// write reply back and reset timer
+	wr := io.MultiWriter(replyWriter, timerResetter)
+	// copy stdout to the stream
+	go func() {
+		defer wg.Done()
+		io.Copy(wr, stdout)
+	}()
+	// copy stderr to the stream
+	go func() {
+		defer wg.Done()
+		io.Copy(wr, stderr)
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		// docs: "it is incorrect to call Wait before all reads from the pipe have completed"
+		wg.Wait()
+		done <- cmd.Wait()
+	}()
+
+	go func() {
+		// wait for first of process finishing or timeout
+		select {
+		case err := <-done:
+			// process finished
+			if err != nil {
+				if _, ok := err.(*exec.ExitError); ok {
+					msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("⚠️ %s", err))
+					api.Send(msg)
+				} else {
+					msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("⚠️ %s", err))
+					api.Send(msg)
+				}
+			}
+		case <-timer.C:
+			// timeout - kill process
+			cmd.Process.Kill()
+			msg := tgbotapi.NewMessage(chatID, "⏰ Timeout!")
+			api.Send(msg)
+		}
+
+		// cleanup
+		timer.Stop()
+	}()
 }
 
 func main() {
