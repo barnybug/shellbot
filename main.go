@@ -115,10 +115,16 @@ func runCommand(api *tgbotapi.BotAPI, chatID int64, text string) {
 
 func main() {
 	token := os.Getenv("TELEGRAM_TOKEN")
+	if token == "" {
+		log.Fatalln("Please set TELEGRAM_TOKEN")
+	}
 	chatID, _ := strconv.Atoi(os.Getenv("TELEGRAM_CHAT_ID"))
+	if chatID == 0 {
+		log.Fatalln("Please set TELEGRAM_CHAT_ID")
+	}
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
-		log.Fatalln("Error connecting to telegram api", err)
+		log.Fatalf("Error connecting to telegram api: %s", err)
 	}
 	config := tgbotapi.NewUpdate(0)
 	config.Timeout = 60
